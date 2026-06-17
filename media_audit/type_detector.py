@@ -1,15 +1,47 @@
 """素材类型识别模块"""
 from __future__ import annotations
 
-import mimetypes
-import zipfile
-import tarfile
-import gzip
 import bz2
+import gzip
+import lzma
+import mimetypes
+import tarfile
+import zipfile
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 
 from .models import MediaType
+
+
+class ArchiveSupportLevel(str, Enum):
+    FULL = "full"
+    SINGLE = "single"
+    NONE = "none"
+
+
+FULL_ARCHIVE_EXTS = {
+    ".zip", ".tar", ".tgz", ".tbz2", ".txz",
+    ".tar.gz", ".tar.bz2", ".tar.xz",
+}
+
+SINGLE_ARCHIVE_EXTS = {".gz", ".bz2", ".xz"}
+
+UNSUPPORTED_ARCHIVE_EXTS = {".rar", ".7z", ".zst", ".lz", ".lzma"}
+
+UNSUPPORTED_ARCHIVE_MAGIC_PREFIXES = [
+    b"Rar!",
+    b"7z\xbc\xaf\x27\x1c",
+    b"(\xb5/\xfd",
+    b"zL",
+]
+
+STRIP_SUFFIX_FOR_SINGLE = {
+    ".gz": ".gz",
+    ".bz2": ".bz2",
+    ".xz": ".xz",
+}
+
 
 
 IMAGE_EXTENSIONS = {
@@ -80,7 +112,8 @@ ARCHIVE_MAGIC = {
     b"Rar!": "application/x-rar",
     b"\x1f\x8b": "application/gzip",
     b"BZh": "application/x-bzip2",
-    b"\xfd7zXZ\x00": "application/x-7z-compressed",
+    b"\xfd7zXZ\x00": "application/x-xz",
+    b"7z\xbc\xaf\x27\x1c": "application/x-7z-compressed",
     b"ustar": "application/x-tar",
 }
 
@@ -196,16 +229,121 @@ def is_archive(file_path: str | Path) -> bool:
     except (tarfile.TarError, OSError):
         pass
     try:
-        with gzip.open(path):
-            return True
+        with gzip.open(path, "rb") as f:
+            f.read(1)
+        return True
     except (OSError, EOFError, gzip.BadGzipFile):
         pass
     try:
-        with bz2.open(path):
-            return True
+        with bz2.open(path, "rb") as f:
+            f.read(1)
+        return True
     except (OSError, EOFError, ValueError):
         pass
-    return False
+    try:
+        with lzma.open(path, "rb") as f:
+            f.read(1)
+        return True
+    except (OSError, EOFError, lzma.LZMAError):
+        pass
+    mt, _ = detect_media_type(path)
+    return mt == MediaType.ARCHIVE
+
+
+def get_archive_support_level(file_path: str | Path) -> Tuple[ArchiveSupportLevel, str]:
+    path = Path(file_path).resolve()
+    name = path.name.lower()
+    magic = _read_magic(path, max_bytes=16)
+
+    for ext in FULL_ARCHIVE_EXTS:
+        if name.endswith(ext):
+            if zipfile.is_zipfile(path):
+                return ArchiveSupportLevel.FULL, "application/zip"
+            try:
+                with tarfile.open(path):
+                    return ArchiveSupportLevel.FULL, "application/x-tar"
+            except (tarfile.TarError, OSError):
+                pass
+
+    if zipfile.is_zipfile(path):
+        return ArchiveSupportLevel.FULL, "application/zip"
+    try:
+        with tarfile.open(path):
+            return ArchiveSupportLevel.FULL, "application/x-tar"
+    except (tarfile.TarError, OSError):
+        pass
+
+    for prefix in UNSUPPORTED_ARCHIVE_MAGIC_PREFIXES:
+        if magic.startswith(prefix):
+            mime = {
+                b"Rar!": "application/x-rar",
+                b"7z\xbc\xaf\x27\x1c": "application/x-7z-compressed",
+                b"(\xb5/\xfd": "application/zstd",
+                b"zL": "application/x-lzip",
+            }.get(prefix, "application/x-compressed")
+            return ArchiveSupportLevel.NONE, mime
+
+    for ext in UNSUPPORTED_ARCHIVE_EXTS:
+        if name.endswith(ext):
+            mime = {
+                ".rar": "application/x-rar",
+                ".7z": "application/x-7z-compressed",
+                ".zst": "application/zstd",
+                ".lz": "application/x-lzip",
+                ".lzma": "application/x-lzma",
+            }.get(ext, "application/x-compressed")
+            return ArchiveSupportLevel.NONE, mime
+
+    for ext in SINGLE_ARCHIVE_EXTS:
+        if name.endswith(ext):
+            try:
+                if ext == ".gz":
+                    with gzip.open(path, "rb") as f:
+                        f.read(1)
+                elif ext == ".bz2":
+                    with bz2.open(path, "rb") as f:
+                        f.read(1)
+                elif ext == ".xz":
+                    with lzma.open(path, "rb") as f:
+                        f.read(1)
+                mime = {
+                    ".gz": "application/gzip",
+                    ".bz2": "application/x-bzip2",
+                    ".xz": "application/x-xz",
+                }[ext]
+                return ArchiveSupportLevel.SINGLE, mime
+            except (OSError, EOFError, lzma.LZMAError, gzip.BadGzipFile, ValueError):
+                pass
+
+    if magic.startswith(b"\x1f\x8b"):
+        try:
+            with gzip.open(path, "rb") as f:
+                f.read(1)
+            return ArchiveSupportLevel.SINGLE, "application/gzip"
+        except (OSError, EOFError, gzip.BadGzipFile):
+            pass
+    if magic.startswith(b"BZh"):
+        try:
+            with bz2.open(path, "rb") as f:
+                f.read(1)
+            return ArchiveSupportLevel.SINGLE, "application/x-bzip2"
+        except (OSError, EOFError, ValueError):
+            pass
+
+    return ArchiveSupportLevel.NONE, ""
+
+
+def _guess_single_decompressed_name(path: Path) -> str:
+    name = path.name
+    for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz"):
+        if name.lower().endswith(ext):
+            mapping = {".tgz": ".tar", ".tbz2": ".tar", ".txz": ".tar",
+                       ".tar.gz": ".tar", ".tar.bz2": ".tar", ".tar.xz": ".tar"}
+            return name[: -len(ext)] + mapping[ext]
+    for ext in (".gz", ".bz2", ".xz"):
+        if name.lower().endswith(ext):
+            return name[: -len(ext)]
+    return name + ".decompressed"
 
 
 def list_archive_contents(file_path: str | Path) -> list[str]:
@@ -223,7 +361,12 @@ def list_archive_contents(file_path: str | Path) -> list[str]:
     try:
         with tarfile.open(path) as tf:
             contents = [m.name for m in tf.getmembers() if m.isfile()]
+            return contents
     except (tarfile.TarError, OSError):
         pass
 
-    return contents
+    level, _ = get_archive_support_level(path)
+    if level == ArchiveSupportLevel.SINGLE:
+        return [_guess_single_decompressed_name(path)]
+
+    return []

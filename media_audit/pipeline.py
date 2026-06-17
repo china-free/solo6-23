@@ -1,12 +1,15 @@
 """审核流水线 - 目录扫描、压缩包解压、批量处理"""
 from __future__ import annotations
 
+import bz2
+import gzip
+import lzma
 import os
 import shutil
 import tempfile
 import time
-import zipfile
 import tarfile
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator, Iterable, Optional
@@ -24,7 +27,10 @@ from .metadata import extract_basic_metadata, extract_full_metadata
 from .rules import AuditRule, apply_rules, build_default_rules, load_rules_from_config
 from .type_detector import (
     ARCHIVE_EXTENSIONS,
+    ArchiveSupportLevel,
+    _guess_single_decompressed_name,
     detect_media_type,
+    get_archive_support_level,
     is_archive,
     list_archive_contents,
 )
@@ -110,14 +116,57 @@ def _temp_dir(prefix: str = "media_audit_") -> Generator[Path, None, None]:
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _extract_single_compressed(archive: Path, target: Path) -> Optional[Path]:
+    name = _guess_single_decompressed_name(archive)
+    out_path = target / name
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    opener = None
+    suffix = archive.suffix.lower()
+    if suffix == ".gz":
+        opener = gzip.open
+    elif suffix == ".bz2":
+        opener = bz2.open
+    elif suffix == ".xz":
+        opener = lzma.open
+    if not opener:
+        head = archive.read_bytes()[:8]
+        if head.startswith(b"\x1f\x8b"):
+            opener = gzip.open
+        elif head.startswith(b"BZh"):
+            opener = bz2.open
+        elif head.startswith(b"\xfd7zXZ\x00"):
+            opener = lzma.open
+    if not opener:
+        return None
+    try:
+        with opener(archive, "rb") as src, open(out_path, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+    except (OSError, EOFError, lzma.LZMAError, gzip.BadGzipFile, ValueError):
+        if out_path.exists():
+            out_path.unlink(missing_ok=True)
+        return None
+    if out_path.is_file() and out_path.stat().st_size >= 0:
+        return out_path.resolve()
+    return None
+
+
 def extract_archive(
     archive_path: str | Path,
     extract_to: Optional[str | Path] = None,
-) -> tuple[Path, list[Path]]:
+) -> tuple[Path, list[Path], ArchiveSupportLevel, str]:
     archive = Path(archive_path).resolve()
     target = Path(extract_to).resolve() if extract_to else Path(tempfile.mkdtemp(prefix="extracted_"))
     target.mkdir(parents=True, exist_ok=True)
     extracted: list[Path] = []
+
+    level, mime = get_archive_support_level(archive)
+
+    if level == ArchiveSupportLevel.NONE:
+        note = (
+            f"压缩包格式暂不支持自动解压（mime={mime or 'unknown'}），"
+            "请安装对应工具后手动解压或使用 zip/tar.gz 等标准格式。"
+        )
+        return target, [], level, note
 
     if zipfile.is_zipfile(archive):
         try:
@@ -137,9 +186,10 @@ def extract_archive(
                     fp = target / clean
                     if fp.is_file() and not fp.name.startswith("."):
                         extracted.append(fp.resolve())
-        except (zipfile.BadZipFile, OSError, RuntimeError):
-            pass
-        return target, extracted
+        except (zipfile.BadZipFile, OSError, RuntimeError) as e:
+            return target, [], level, f"zip 解压失败: {type(e).__name__}: {e}"
+        note = f"zip 解压成功，共 {len(extracted)} 个文件"
+        return target, extracted, level, note
 
     try:
         with tarfile.open(archive) as tf:
@@ -165,8 +215,17 @@ def extract_archive(
                     continue
     except (tarfile.TarError, OSError):
         pass
+    else:
+        if extracted:
+            return target, extracted, level, f"tar 解压成功，共 {len(extracted)} 个文件"
 
-    return target, extracted
+    if level == ArchiveSupportLevel.SINGLE:
+        out = _extract_single_compressed(archive, target)
+        if out is not None:
+            return target, [out], level, f"单文件压缩解包成功 -> {out.name}"
+        return target, [], level, "单文件压缩解包失败（文件损坏或格式不匹配）"
+
+    return target, [], level, "未识别的压缩格式或解压失败"
 
 
 class AuditPipeline:
@@ -205,6 +264,74 @@ class AuditPipeline:
             shutil.rmtree(td, ignore_errors=True)
         self._temp_dirs.clear()
 
+    def _recursive_extract(self, archive_path: Path, depth: int = 0) -> tuple[list[Path], list[Issue], str]:
+        issues: list[Issue] = []
+        all_extracted: list[Path] = []
+        if depth > 3:
+            issues.append(Issue(
+                code="ARCHIVE_TOO_DEEP",
+                message=f"压缩包嵌套超过 {depth} 层，停止递归解压",
+                severity=IssueSeverity.WARNING,
+                field="file_path",
+            ))
+            return all_extracted, issues, "嵌套过深"
+
+        td, extracted, level, note = extract_archive(archive_path)
+        self._temp_dirs.append(td)
+
+        if level == ArchiveSupportLevel.NONE:
+            issues.append(Issue(
+                code="UNSUPPORTED_ARCHIVE",
+                message=note,
+                severity=IssueSeverity.WARNING,
+                field="media_type",
+                details={"note": note, "support_level": level.value},
+            ))
+            return all_extracted, issues, note
+
+        if not extracted:
+            issues.append(Issue(
+                code="ARCHIVE_EMPTY",
+                message=note or "压缩包解压后未得到任何可审核的素材",
+                severity=IssueSeverity.WARNING,
+                field="media_type",
+                details={"support_level": level.value},
+            ))
+            return all_extracted, issues, note
+
+        issues.append(Issue(
+            code="ARCHIVE_EXTRACTED",
+            message=note,
+            severity=IssueSeverity.INFO,
+            field="media_type",
+            details={
+                "support_level": level.value,
+                "extracted_count": len(extracted),
+            },
+        ))
+
+        pending = list(extracted)
+        seen: set[str] = set()
+        while pending:
+            f = pending.pop(0)
+            key = str(f.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            if not f.is_file():
+                continue
+            emt, _ = detect_media_type(f)
+            if emt == MediaType.ARCHIVE:
+                sub_extracted, sub_issues, sub_note = self._recursive_extract(f, depth=depth + 1)
+                issues.extend(sub_issues)
+                for s in sub_extracted:
+                    if str(s.resolve()) not in seen:
+                        pending.append(s)
+            else:
+                all_extracted.append(f.resolve())
+
+        return all_extracted, issues, note
+
     def scan(
         self,
         input_path: str | Path,
@@ -219,28 +346,27 @@ class AuditPipeline:
         )
 
         all_files: list[Path] = []
-        archive_files: list[Path] = []
+        archive_side_issues: dict[str, list[Issue]] = {}
 
         for f in raw_files:
             mt, _ = detect_media_type(f)
             if self.extract_archives and mt == MediaType.ARCHIVE:
-                archive_files.append(f)
+                extracted, issues, _note = self._recursive_extract(f, depth=0)
+                archive_side_issues[str(f.resolve())] = issues
+                for ef in extracted:
+                    if ef.is_file():
+                        emt, _ = detect_media_type(ef)
+                        if emt != MediaType.ARCHIVE:
+                            all_files.append(ef)
+                all_files.append(f.resolve())
             else:
-                all_files.append(f)
-
-        for af in archive_files:
-            td, extracted = extract_archive(af)
-            self._temp_dirs.append(td)
-            for ef in extracted:
-                if ef.is_file():
-                    emt, _ = detect_media_type(ef)
-                    if emt != MediaType.ARCHIVE:
-                        all_files.append(ef)
+                all_files.append(f.resolve())
 
         results: list[AuditResult] = []
         total = len(all_files)
 
         for idx, file_path in enumerate(all_files):
+            side_issues = archive_side_issues.get(str(file_path.resolve()), [])
             try:
                 if self.skip_metadata:
                     md = extract_basic_metadata(file_path, compute_hash=self.compute_hash)
@@ -264,6 +390,19 @@ class AuditPipeline:
                         details={"error_type": type(e).__name__},
                     )],
                 )
+            if side_issues:
+                result.issues.extend(side_issues)
+                for si in side_issues:
+                    if si.code not in result.matched_rules:
+                        result.matched_rules.append(si.code)
+                    if si.severity in (IssueSeverity.ERROR, IssueSeverity.CRITICAL):
+                        result.score = max(0.0, result.score - 10)
+                        if result.status == AuditStatus.PASS:
+                            result.status = AuditStatus.REVIEW
+                    elif si.severity == IssueSeverity.WARNING:
+                        result.score = max(0.0, result.score - 5)
+                        if result.status == AuditStatus.PASS:
+                            result.status = AuditStatus.REVIEW
             results.append(result)
             if progress_callback:
                 progress_callback(idx + 1, total, file_path)
