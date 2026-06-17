@@ -1,0 +1,123 @@
+[
+  {
+    "id": "IMG_MIN_RESOLUTION",
+    "name": "图片最小分辨率检查",
+    "description": "图片宽度和高度均不得低于 1080px",
+    "conditions": [
+      {"field": "media_type", "operator": "==", "value": "image"},
+      {"field": "width", "operator": "<", "value": 1080, "media_types": ["image"]}
+    ],
+    "condition_logic": "AND",
+    "action": "review",
+    "issue_code": "IMG_LOW_RES",
+    "issue_message": "图片宽度低于 1080px",
+    "severity": "warning",
+    "score_delta": -10,
+    "enabled": true
+  },
+  {
+    "id": "IMG_MAX_FILESIZE",
+    "name": "图片文件大小限制",
+    "description": "单张图片不得超过 15MB",
+    "conditions": [
+      {"field": "file_size", "operator": ">", "value": 15728640, "media_types": ["image"]}
+    ],
+    "condition_logic": "AND",
+    "action": "review",
+    "issue_code": "IMG_SIZE_LIMIT",
+    "issue_message": "图片超过 15MB",
+    "severity": "warning",
+    "score_delta": -5,
+    "enabled": true
+  },
+  {
+    "id": "VID_MIN_DURATION",
+    "name": "视频最短时长",
+    "description": "视频不得短于 5 秒",
+    "conditions": [
+      {"field": "duration_seconds", "operator": "<", "value": 5, "media_types": ["video"]}
+    ],
+    "condition_logic": "AND",
+    "action": "review",
+    "issue_code": "VID_TOO_SHORT",
+    "issue_message": "视频时长少于 5 秒",
+    "severity": "warning",
+    "score_delta": -8,
+    "enabled": true
+  },
+  {
+    "id": "VID_MAX_DURATION",
+    "name": "视频最长时长",
+    "description": "视频不得超过 15 分钟",
+    "conditions": [
+      {"field": "duration_seconds", "operator": ">", "value": 900, "media_types": ["video"]}
+    ],
+    "condition_logic": "AND",
+    "action": "review",
+    "issue_code": "VID_TOO_LONG",
+    "issue_message": "视频超过 15 分钟",
+    "severity": "info",
+    "score_delta": -3,
+    "enabled": true
+  },
+  {
+    "id": "VID_HD_REQUIRED",
+    "name": "视频高清要求",
+    "description": "视频高度必须达到 1080px",
+    "conditions": [
+      {"field": "height", "operator": "<", "value": 1080, "media_types": ["video"]}
+    ],
+    "condition_logic": "AND",
+    "action": "review",
+    "issue_code": "VID_NOT_HD",
+    "issue_message": "视频分辨率未达 1080P",
+    "severity": "warning",
+    "score_delta": -12,
+    "enabled": true
+  },
+  {
+    "id": "AUD_MIN_QUALITY",
+    "name": "音频采样率要求",
+    "description": "音频采样率不低于 44100Hz",
+    "conditions": [
+      {"field": "sample_rate", "operator": "<", "value": 44100, "media_types": ["audio"]}
+    ],
+    "condition_logic": "AND",
+    "action": "review",
+    "issue_code": "AUD_LOW_RATE",
+    "issue_message": "音频采样率低于 44.1kHz",
+    "severity": "info",
+    "score_delta": -5,
+    "enabled": true
+  },
+  {
+    "id": "TXT_UTF8_ONLY",
+    "name": "文本编码要求",
+    "description": "文本文件必须使用 UTF-8 编码",
+    "conditions": [
+      {"field": "text_encoding", "operator": "not_in", "value": ["utf-8", "utf-8-sig", ""], "media_types": ["text"]}
+    ],
+    "condition_logic": "AND",
+    "action": "review",
+    "issue_code": "TXT_ENCODING",
+    "issue_message": "文本非 UTF-8 编码",
+    "severity": "warning",
+    "score_delta": -8,
+    "enabled": true
+  },
+  {
+    "id": "EMPTY_FILE_REJECT",
+    "name": "空文件拒绝",
+    "description": "文件大小为 0 直接拒绝",
+    "conditions": [
+      {"field": "file_size", "operator": "==", "value": 0}
+    ],
+    "condition_logic": "AND",
+    "action": "reject",
+    "issue_code": "EMPTY_FILE",
+    "issue_message": "空文件，已拒绝",
+    "severity": "critical",
+    "score_delta": -100,
+    "enabled": true
+  }
+]
