@@ -11,6 +11,7 @@ from .models import (
     AuditResult,
     AuditStatus,
     Issue,
+    IssueCategory,
     IssueSeverity,
     MediaMetadata,
     MediaType,
@@ -46,6 +47,7 @@ class AuditRule:
     issue_code: str = ""
     issue_message: str = ""
     severity: IssueSeverity = IssueSeverity.WARNING
+    category: IssueCategory = IssueCategory.OTHER
     score_delta: float = 0.0
     enabled: bool = True
 
@@ -60,6 +62,7 @@ class AuditRule:
             code=self.issue_code or self.id,
             message=self.issue_message or self.name,
             severity=self.severity,
+            category=self.category,
             details={"rule_id": self.id},
         )
 
